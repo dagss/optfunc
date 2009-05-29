@@ -1,5 +1,5 @@
 from optparse import OptionParser, make_option
-import sys, inspect, re
+import sys, inspect, re, os
 
 single_char_prefix_re = re.compile('^[a-zA-Z0-9]_')
 
@@ -21,7 +21,7 @@ class ErrorCollectingOptionParser(OptionParser):
     def error(self, msg):
         self._errors.append(msg)
 
-def func_to_optionparser(func):
+def func_to_optionparser(func, prog=None):
     args, varargs, varkw, defaultvals = inspect.getargspec(func)
     defaultvals = defaultvals or ()
     options = dict(zip(args[-len(defaultvals):], defaultvals))
@@ -34,7 +34,7 @@ def func_to_optionparser(func):
         required_args = args[argstart:]
     
     # Build the OptionParser:
-    opt = ErrorCollectingOptionParser(usage = func.__doc__)
+    opt = ErrorCollectingOptionParser(usage=func.__doc__, prog=prog)
     
     helpdict = getattr(func, 'optfunc_arghelp', {})
     
@@ -64,62 +64,55 @@ def func_to_optionparser(func):
             short_name, long_name, action=action, dest=name, default=example,
             help = helpdict.get(funcname, '')
         ))
-    
-    return opt, required_args
+   
+    return opt, required_args, varargs is not None
 
-def resolve_args(func, argv):
-    parser, required_args = func_to_optionparser(func)
+def resolve_args(func, argv, interspersed_args=True, prog=None):
+    parser, required_args, has_varargs = func_to_optionparser(func, prog=prog)
+    if not interspersed_args:
+        parser.disable_interspersed_args()
     options, args = parser.parse_args(argv)
     
     # Do we have correct number af required args?
-    if len(required_args) != len(args):
+    if len(required_args) != len(args) and not \
+            (has_varargs and len(required_args) <= len(args)):
         if not hasattr(func, 'optfunc_notstrict'):
             parser._errors.append('Required %d arguments, got %d' % (
                 len(required_args), len(args)
             ))
-    
+
     # Ensure there are enough arguments even if some are missing
     args += [None] * (len(required_args) - len(args))
-    for i, name in enumerate(required_args):
-        setattr(options, name, args[i])
-    
-    return options.__dict__, parser._errors
+    return args, options.__dict__, parser._errors
 
-def run(func, argv=None, stderr=sys.stderr):
-    argv = argv or sys.argv[1:]
-    include_func_name_in_errors = False
+def run(func, argv=None, stderr=sys.stderr, include_func_name_in_errors=False,
+        prog=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    interspersed_args = True
+
     # Deal with multiple functions
     if isinstance(func, (tuple, list)):
-        funcs = dict([
-            (fn.__name__, fn) for fn in func
-        ])
-        try:
-            func_name = argv.pop(0)
-        except IndexError:
-            func_name = None
-        if func_name not in funcs:
-            names = ["'%s'" % fn.__name__ for fn in func]
-            s = ', '.join(names[:-1])
-            if len(names) > 1:
-                s += ' or %s' % names[-1]
-            stderr.write("Unknown command: try %s\n" % s)
-            return
-        func = funcs[func_name]
-        include_func_name_in_errors = True
+        func = _master_func(func, prog=prog)
+        interspersed_args = False
 
     if inspect.isfunction(func):
-        resolved, errors = resolve_args(func, argv)
+        args, kw, errors = resolve_args(func, argv, 
+                                        interspersed_args=interspersed_args,
+                                        prog=prog)
     elif inspect.isclass(func):
         if hasattr(func, '__init__'):
-            resolved, errors = resolve_args(func.__init__, argv)
+            args, kw, errors = resolve_args(func.__init__, argv,
+                                            interspersed_args=interspersed_args,
+                                            prog=prog)
         else:
-            resolved, errors = {}, []
+            args, kw, errors = [], {}, []
     else:
         raise TypeError('arg is not a Python function or class')
     
     if not errors:
         try:
-            return func(**resolved)
+            return func(*args, **kw)
         except Exception, e:
             if include_func_name_in_errors:
                 stderr.write('%s: ' % func.__name__)
@@ -128,6 +121,40 @@ def run(func, argv=None, stderr=sys.stderr):
         if include_func_name_in_errors:
             stderr.write('%s: ' % func.__name__)
         stderr.write("%s\n" % '\n'.join(errors))
+
+# Subcommand support
+def _master_func(subcommands, prog=None):
+    funcs = dict([
+        (fn.__name__, fn) for fn in subcommands
+    ])
+
+    if prog is None:
+        prog = os.path.basename(sys.argv[0])
+
+    def master(cmd, *argv):
+        if cmd not in funcs:
+            names = ["'%s'" % fn.__name__ for fn in func]
+            s = ', '.join(names[:-1])
+            if len(names) > 1:
+                s += ' or %s' % names[-1]
+            stderr.write("Unknown command: try %s\n" % s)
+            return
+        run(funcs[cmd], argv=list(argv), include_func_name_in_errors=True,
+            prog="%s %s" % (prog, cmd))
+
+    doc = ["Commands:"]
+    max_name_len = max([len(fn.__name__) for fn in subcommands])
+    max_desc_len = min(5, 80-max_name_len)
+    fmt_str = "  %%%ds  %%s" % max_name_len
+
+    for func in subcommands:
+        # XXX: how to extract short subcommand docstrings?
+        fdoc = ""
+        doc.append(fmt_str % (func.__name__, fdoc))
+
+    master.__doc__ = "Usage: %prog COMMAND ...\n\n" + "\n".join(doc)
+
+    return master
 
 # Decorators
 def notstrict(fn):
